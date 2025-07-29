@@ -495,6 +495,10 @@ class twofactor_gauthenticator extends rcube_plugin
             $edata = $rcmail->encrypt(json_encode($data));
             $data = $edata != null ? $edata: $data;
         }
+        if ($data['activate'] != true) {
+            // if deactivated, remove all data (secret was still generated and couldn't be removed)
+            $data = array();
+        }
         $arr_prefs['twofactor_gauthenticator'] = $data;
         rcube::write_log('twofactor_gauthenticator',"WARN: 2FA may have changed!");
         return $user->save_prefs($arr_prefs);
