@@ -41,8 +41,7 @@ class twofactor_gauthenticator extends rcube_plugin
 
         // Block data access via AJAX for partially authenticated users who have 2FA enabled (by Stephen K. Gielda <security@codamail.com>)
 	if (isset($_SESSION['twofactor_gauthenticator_login']) && 
-	    (!isset($_SESSION['twofactor_gauthenticator_2FA_login']) || 
-	     $_SESSION['twofactor_gauthenticator_2FA_login'] < $_SESSION['twofactor_gauthenticator_login']) && 
+	    !$this->__is2FAFresh() &&
 	    isset($_REQUEST['_remote']) &&
 	    $rcmail->action !== 'plugin.twofactor_gauthenticator-checkcode' &&
 	    $rcmail->task !== 'login') {
@@ -168,16 +167,8 @@ class twofactor_gauthenticator extends rcube_plugin
         if ($config_2FA['activate'] ?? false) {
             // with IP allowed, we don't need to check anything
             if ($rcmail->config->get('whitelist')) {
+                $realip = $this->__getClientIP();
                 foreach ($rcmail->config->get('whitelist') as $ip_to_check) {
-                    if (isset($_SERVER['HTTP_CLIENT_IP']) && array_key_exists('HTTP_CLIENT_IP', $_SERVER)) {
-                        $realip = $_SERVER['HTTP_CLIENT_IP'];
-                    } elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR']) && array_key_exists('HTTP_X_FORWARDED_FOR', $_SERVER)) {
-                        $realips = explode(',', $_SERVER['HTTP_X_FORWARDED_FOR']);
-                        $realips = array_map('trim', $realips);
-                        $realip = $realips[0];
-                    } else {
-                        $realip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
-                    }
                     if (CIDR::match($realip, $ip_to_check)) {
                         if (isset($_SESSION['twofactor_gauthenticator_login'])) {
                             if ($rcmail->task === 'login') {
@@ -194,7 +185,12 @@ class twofactor_gauthenticator extends rcube_plugin
             $remember = rcube_utils::get_input_value('_remember_2FA', rcube_utils::INPUT_POST);
 
             if ($code) {
+                if ($this->__isLockedOut()) {
+                    $this->__waitSeconds($this->__blockedRemaining());   // feel the remaining block
+                    $this->__exitSession();                              // then full teardown
+                }
                 if (self::__checkCode($code) || self::__isRecoveryCode($code)) {
+                    $this->__clearFailedAttempts();
                     if (self::__isRecoveryCode($code)) {
                         self::__consumeRecoveryCode($code);
                     }
@@ -208,11 +204,13 @@ class twofactor_gauthenticator extends rcube_plugin
                     if ($rcmail->config->get('enable_fail_logs')) {
                         $this->__logError();
                     }
-                    $this->__exitSession();
+                    $wait = $this->__registerFailedAttempt();   // record BEFORE teardown (outlives it)
+                    $this->__waitSeconds($wait);                // FELT delay before leaving
+                    $this->__exitSession();                     // EVERY failed login code -> full teardown
                 }
             }
             // we're into some task but marked with login...
-            elseif ($rcmail->task !== 'login' && ! $_SESSION['twofactor_gauthenticator_2FA_login'] >= $_SESSION['twofactor_gauthenticator_login']) {
+            elseif ($rcmail->task !== 'login' && !$this->__is2FAFresh()) {
                 $this->__exitSession();
             }
 
@@ -278,7 +276,7 @@ class twofactor_gauthenticator extends rcube_plugin
         //
         // Solution: if user don't have session created by any rendered page, we kick out
         $config_2FA = self::__get2FAconfig();
-        if (!$_SESSION['twofactor_gauthenticator_2FA_login'] && $config_2FA['activate']) {
+        if ($config_2FA['activate'] && !$this->__is2FAFresh()) {
             $this->__exitSession();
         }
 
@@ -428,19 +426,273 @@ class twofactor_gauthenticator extends rcube_plugin
     // used with ajax
     public function checkCode()
     {
-        $code = rcube_utils::get_input_value('code', rcube_utils::INPUT_GET);
-        //$secret = rcube_utils::get_input_value('secret', rcube_utils::INPUT_GET);
+        $code   = rcube_utils::get_input_value('code', rcube_utils::INPUT_GET);
         $secret = rcube_utils::get_input_value('secret', rcube_utils::INPUT_GET);
 
+        // EMENDA 4: an explicit secret is required. Never verify against the real stored
+        // secret (that would turn this endpoint into a verification oracle for tests).
+        if (!$secret) {
+            echo $this->gettext('code_ko');
+            exit;
+        }
+
+        // EMENDA 4: while blocked, never return a verdict — wait the remaining block, then ko.
+        if ($this->__isLockedOut()) {
+            $this->__waitSeconds($this->__blockedRemaining());
+            echo $this->gettext('code_ko');
+            exit;
+        }
+
         if (self::__checkCode($code, $secret)) {
+            $this->__clearFailedAttempts();
             echo $this->gettext('code_ok');
         } else {
+            $wait = $this->__registerFailedAttempt();
+            $this->__waitSeconds($wait);
             echo $this->gettext('code_ko');
         }
         exit;
     }
 
     //------------- private methods
+
+    /**
+     * Returns true if $ip matches any entry in the trusted-proxy list.
+     * Malformed entries never match (CIDR::match returns false for them) => fail closed.
+     */
+    private function __isTrustedProxy($ip, array $trusted): bool
+    {
+        foreach ($trusted as $entry) {
+            if (CIDR::match($ip, $entry)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Resolve the client IP for the whitelist decision and the rate-limit key.
+     * Default: REMOTE_ADDR (the real TCP peer) only. X-Forwarded-For is parsed ONLY
+     * when the direct peer REMOTE_ADDR is itself a configured trusted proxy, and then
+     * only the first untrusted hop (scanning from the proxy-nearest side) is used.
+     */
+    private function __getClientIP(): string
+    {
+        $rcmail  = rcmail::get_instance();
+        $remote  = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        $trusted = $rcmail->config->get('twofactor_trusted_proxies', array());
+
+        if (is_array($trusted) && count($trusted) > 0 && $this->__isTrustedProxy($remote, $trusted)) {
+            $xff = filter_input(INPUT_SERVER, 'HTTP_X_FORWARDED_FOR');
+            if (is_string($xff) && $xff !== '') {
+                $hops = array_map('trim', explode(',', $xff));
+                // scan RIGHT->LEFT: the rightmost hop is the trusted proxy's immediate peer.
+                // The first hop that is NOT itself a trusted proxy is the originating client.
+                // A client-supplied leading (left) value is therefore never used unless every
+                // hop to its right is a proxy we explicitly trust.
+                for ($i = count($hops) - 1; $i >= 0; $i--) {
+                    if ($hops[$i] === '') {
+                        continue;
+                    }
+                    if (!$this->__isTrustedProxy($hops[$i], $trusted)) {
+                        // Never trust an unvalidated/malformed forwarded value; CIDR::match
+                        // is the final arbiter, and it returns false for a malformed IP (default deny).
+                        return $hops[$i];
+                    }
+                }
+            }
+        }
+        return $remote;
+    }
+
+    /**
+     * Shared freshness invariant: 2FA is complete only when the 2FA login marker is set
+     * and >= the password-auth login marker. Isset-guarded for PHP 8 (no undefined-key warnings).
+     */
+    private function __is2FAFresh(): bool
+    {
+        if (!isset($_SESSION['twofactor_gauthenticator_login'])) {
+            return false;
+        }
+        if (!isset($_SESSION['twofactor_gauthenticator_2FA_login'])) {
+            return false;
+        }
+        return $_SESSION['twofactor_gauthenticator_2FA_login']
+            >= $_SESSION['twofactor_gauthenticator_login'];
+    }
+
+    /**
+     * Composite rate-limit key: the canonical resolver IP (no attacker-controllable header)
+     * plus the authenticated username.
+     */
+    private function __clientFailureKey(): string
+    {
+        $rcmail   = rcmail::get_instance();
+        $ip       = $this->__getClientIP();
+        $username = $rcmail->user->data['username'] ?? '';
+        return md5($ip . '|' . $username);
+    }
+
+    /**
+     * Incremental wait (seconds) applied after the N-th accumulated failure (level N).
+     * Reads `twofactor_lockout_delays` (default [1,2,5,20,60,300,600]); non-array or empty
+     * -> default. Each value is clamped to >= 1; levels beyond the array length use the LAST
+     * value.
+     */
+    private function __failureDelay(int $level): int
+    {
+        $rcmail = rcmail::get_instance();
+        $delays = $rcmail->config->get('twofactor_lockout_delays', array(1, 2, 5, 20, 60, 300, 600));
+        if (!is_array($delays) || empty($delays)) {
+            $delays = array(1, 2, 5, 20, 60, 300, 600);
+        }
+        $idx = min($level, count($delays)) - 1;
+        return max(1, (int) $delays[$idx]);
+    }
+
+    /**
+     * Path to the per-key JSON fail-state file at {log_dir}/twofactor_gauth_fail_{md5key}.json.
+     * Returns null (silent degrade: logout-on-failure still enforced by callers) when log_dir
+     * is unset, missing, or not writable.
+     */
+    private function __failStatePath(string $key): ?string
+    {
+        $rcmail  = rcmail::get_instance();
+        $log_dir = (string) $rcmail->config->get('log_dir');
+        if ($log_dir === '' || !is_dir($log_dir) || !is_writable($log_dir)) {
+            return null;   // cannot persist: logout-on-failure still enforced by callers
+        }
+        return rtrim($log_dir, '/') . '/twofactor_gauth_fail_' . $key . '.json';
+    }
+
+    /**
+     * Read the per-key JSON fail state. Returns null if the file is missing, unreadable,
+     * or does not decode to an array.
+     */
+    private function __readFailState(string $key): ?array
+    {
+        $path = $this->__failStatePath($key);
+        if (!$path || !is_file($path)) {
+            return null;
+        }
+        $data  = @file_get_contents($path);
+        $state = $data !== false ? json_decode($data, true) : null;
+        return is_array($state) ? $state : null;
+    }
+
+    /**
+     * Write the per-key JSON fail state (locked exclusive write). Silent if log_dir unusable.
+     */
+    private function __writeFailState(string $key, array $state): void
+    {
+        $path = $this->__failStatePath($key);
+        if ($path) {
+            @file_put_contents($path, json_encode($state), LOCK_EX);
+        }
+    }
+
+    /**
+     * Remove the per-key JSON fail state file, if present.
+     */
+    private function __removeFailState(string $key): void
+    {
+        $path = $this->__failStatePath($key);
+        if ($path && is_file($path)) {
+            @unlink($path);
+        }
+    }
+
+    /**
+     * Record a failed 2FA attempt in the persistent per-key JSON state file keyed by
+     * (IP, username). State: ['level' => int, 'last' => int, 'blocked_until' => int].
+     * Resets the level to 0 if the last failure is older than `twofactor_lockout` (default
+     * 900), increments the level, and sets the blocked window to now + __failureDelay(level).
+     * NO eviction here: the caller owns teardown. Degrades silently if log_dir is unusable.
+     */
+    private function __registerFailedAttempt(): int   // returns the applied wait (seconds)
+    {
+        $rcmail  = rcmail::get_instance();
+        $key     = $this->__clientFailureKey();
+        $lockout = (int) $rcmail->config->get('twofactor_lockout', 900);
+        $now     = time();
+
+        $state = $this->__readFailState($key);
+        $level = (int) ($state['level'] ?? 0);
+        if (($state['last'] ?? 0) > 0 && ($now - $state['last']) > $lockout) {
+            $level = 0;                                // stale counter -> reset before counting
+        }
+
+        $level++;
+        $blocked_until = $now + $this->__failureDelay($level);
+        $this->__writeFailState($key, array(
+            'level'         => $level,
+            'last'          => $now,
+            'blocked_until' => $blocked_until,
+        ));
+        return max(0, $blocked_until - $now);
+    }
+
+    /**
+     * True only while the (IP, username) is blocked: a non-stale state array exists and
+     * `blocked_until` is in the future. Returns false if there is no state file, no state
+     * array, or the state is stale (last failure older than `twofactor_lockout`).
+     */
+    private function __isLockedOut(): bool
+    {
+        return $this->__blockedRemaining() > 0;
+    }
+
+    /**
+     * Seconds still blocked for the current (IP, username); 0 when no state, stale, or expired.
+     */
+    private function __blockedRemaining(): int
+    {
+        $rcmail = rcmail::get_instance();
+        $state  = $this->__readFailState($this->__clientFailureKey());
+        if (!is_array($state)) {
+            return 0;
+        }
+        if (($state['last'] ?? 0) > 0 && (time() - $state['last']) > (int) $rcmail->config->get('twofactor_lockout', 900)) {
+            return 0;                                  // stale -> not blocked
+        }
+        return max(0, (int) ($state['blocked_until'] ?? 0) - time());
+    }
+
+    /**
+     * Physical (felt) wait: block the HTTP response for $seconds. Capped at 600s (the scale
+     * maximum) so a single request can never hang longer than the longest configured delay.
+     */
+    private function __waitSeconds(int $seconds): void
+    {
+        $seconds = min(max(0, $seconds), 600);
+        if ($seconds > 0) {
+            usleep($seconds * 1000000);
+        }
+    }
+
+    /**
+     * Reset the failed-attempt counter for the current (IP, username) composite on success
+     * by removing the per-key JSON fail-state file.
+     */
+    private function __clearFailedAttempts(): void
+    {
+        $this->__removeFailState($this->__clientFailureKey());
+    }
+
+    /**
+/**
+     * Clear the plugin 30-day "remember me" cookie (name derived identically to __cookie()).
+     */
+    private function __clearRememberMeCookie(): void
+    {
+        $rcmail   = rcmail::get_instance();
+        $username = $rcmail->user->data['username'] ?? null;
+        if (!$username) {
+            return;
+        }
+        $name = hash_hmac('md5', $username, $rcmail->config->get('des_key'));
+        rcube_utils::setcookie($name, '-del-', time() - 60);
+    }
 
     // redirect to some RC task and remove 'login' user pref
     private function __goingRoundcubeTask($task = 'mail', $action = null)
@@ -453,11 +705,26 @@ class twofactor_gauthenticator extends rcube_plugin
 
     private function __exitSession()
     {
+        $rcmail = rcmail::get_instance();
+
+        // 1. Clear the plugin remember-me cookie (needs username/secret-derived name) first.
+        $this->__clearRememberMeCookie();
+
+        // 2. Full server-side teardown via the Roundcube API (rcmail.php ~1007):
+        //    rcmail::kill_session() -> rcube_session::kill() (rcube_session.php ~410) which
+        //    destroys the stored session, invalidates the session ID (cannot be resumed),
+        //    clears the Roundcube session cookie, and resets $_SESSION to language+temp.
+        $rcmail->kill_session();
+
+        // 3. Belt-and-suspenders: drop the plugin markers explicitly. The V-1 failure
+        //    counter lives in the per-key JSON state file in log_dir (NOT in $_SESSION)
+        //    and MUST survive this teardown to keep rate-limiting across logins.
         unset($_SESSION['twofactor_gauthenticator_login']);
         unset($_SESSION['twofactor_gauthenticator_2FA_login']);
 
-        $rcmail = rcmail::get_instance();
-        header('Location: ?_task=logout&_token='.$rcmail->get_request_token());
+        // 4. UI courtesy redirect only. Teardown already happened server-side; the redirect is
+        //    not the destruction mechanism and needs no request token here.
+        header('Location: ?_task=login');
         exit;
     }
 
