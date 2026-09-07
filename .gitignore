@@ -23,3 +23,10 @@ Session.vim
 .DS_Store
 
 db/*
+# Local Pi runtime state
+.atl/
+
+# SDD working artifacts (planning only, not shipped)
+/openspec/
+
+.codegraph/*
