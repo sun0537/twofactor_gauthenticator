@@ -29,4 +29,4 @@ db/*
 # SDD working artifacts (planning only, not shipped)
 /openspec/
 
-.codegraph/*
+.codegraph/
