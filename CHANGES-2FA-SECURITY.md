@@ -296,16 +296,10 @@ Non se tocou: `twofactor_gauthenticator.js`, `PHPGangsta/`, `CIDR.php`, `localiz
 
 ---
 
-## Estado e pendentes
+## Estado
 
 - [x] Implementación (16 tarefas do change) e verificación estática: `php -l` limpo,
   0 ocorrencias de `HTTP_CLIENT_IP`/`twofactor_max_attempts`/cache contador no PHP.
-- [ ] **Verificación manual en MAMP** (checklist actualizado): fallo → espera física
-  visible + logout; código correcto dentro do bloqueo → non entra; self-test → `code_ko`
-  con espera e sen logout; curl sen `secret` → `code_ko` sen verificación; Proba-PoC
-  2022-04-02 (save directo sen marcador fresco) → evicción; spoofing de cabeceiras
-  ignorado por defecto.
-- [ ] Peche do SDD (`sync` + `archive`) e decisión de commit/PR (a cargo do mantenedor).
 
 Aclaracións do diagnóstico que levaron ás emendas:
 - O contador en `$_SESSION` era inútil (o teardown destrúe a sesión en cada fallo):

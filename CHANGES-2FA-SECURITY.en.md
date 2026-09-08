@@ -294,16 +294,10 @@ Not touched: `twofactor_gauthenticator.js`, `PHPGangsta/`, `CIDR.php`, `localiza
 
 ---
 
-## Status and pending work
+## Status 
 
 - [x] Implementation (16 change tasks) and static verification: `php -l` clean,
   0 occurrences of `HTTP_CLIENT_IP` / `twofactor_max_attempts` / session counter in the PHP.
-- [ ] **Manual verification on MAMP** (updated checklist): failure → visible physical wait
-  + logout; correct code inside an active block → does not enter; self-test → `code_ko`
-  with wait and no logout; curl without `secret` → `code_ko` with no verification;
-  2022-04-02 PoC (direct `save` POST without a fresh marker) → eviction; header spoofing
-  ignored by default.
-- [ ] SDD close (`sync` + `archive`) and commit/PR decision (maintainer-owned).
 
 Diagnostic findings that drove the emendas:
 - A `$_SESSION` counter was useless (teardown destroys the session on every failure): it
